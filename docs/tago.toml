@@ -1,0 +1,10 @@
+title       = "sra"
+baseURL     = "https://sra-cli.tamnd.com/"
+description = "A command line for sra."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/sra-cli"
