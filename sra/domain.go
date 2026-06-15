@@ -2,14 +2,14 @@ package sra
 
 import (
 	"context"
-	"net/url"
 	"strings"
+	"unicode"
 
 	"github.com/tamnd/any-cli/kit"
 	"github.com/tamnd/any-cli/kit/errs"
 )
 
-// domain.go exposes sra as a kit Domain: a driver that a multi-domain
+// domain.go exposes SRA as a kit Domain: a driver that a multi-domain
 // host (ant) enables with a single blank import,
 //
 //	import _ "github.com/tamnd/sra-cli/sra"
@@ -17,14 +17,11 @@ import (
 // exactly as a database/sql program enables a driver with `import _
 // "github.com/lib/pq"`. The init below registers it; the host then dereferences
 // sra:// URIs by routing to the operations Register installs. The same
-// Domain also builds the standalone sra binary (see cli.NewApp), so the
+// Domain also builds the standalone sra binary (see cmd/sra/main.go), so the
 // binary and a host share one source of truth.
-//
-// This is the scaffold's starting point: one resource type, "page", served by a
-// resolver op and a list op. Add your real types here as you model the site.
 func init() { kit.Register(Domain{}) }
 
-// Domain is the sra driver. It carries no state; the per-run client is
+// Domain is the SRA driver. It carries no state; the per-run client is
 // built by the factory Register hands kit.
 type Domain struct{}
 
@@ -36,138 +33,208 @@ func (Domain) Info() kit.DomainInfo {
 		Hosts:  []string{Host},
 		Identity: kit.Identity{
 			Binary: "sra",
-			Short:  "A command line for sra.",
-			Long: `A command line for sra.
+			Short:  "Read public NCBI SRA sequencing run data.",
+			Long: `Read public NCBI SRA sequencing run data.
 
-sra reads public sra data over plain HTTPS, shapes it into
-clean records, and prints output that pipes into the rest of your tools. No API
-key, nothing to run alongside it.`,
-			Site: Host,
+sra reads from the NCBI Sequence Read Archive (8M+ runs) over plain HTTPS,
+shapes it into clean records, and prints output that pipes into the rest of
+your tools. No API key required for up to 3 req/s; set NCBI_API_KEY for
+higher limits.`,
+			Site: "www.ncbi.nlm.nih.gov/sra",
 			Repo: "https://github.com/tamnd/sra-cli",
 		},
 	}
 }
 
-// Register installs the client factory and every operation onto app. A resolver
-// op (Single) names its own record type and answers `ant get`; a List op
-// enumerates a parent resource's members and answers `ant ls`.
+// Register installs the client factory and every operation onto app.
 func (Domain) Register(app *kit.App) {
 	app.SetClient(newClient)
 
-	// Resolver op: one record per id, the home of `sra page` and
-	// `ant get sra://page/<id>`.
-	kit.Handle(app, kit.OpMeta{Name: "page", Group: "read", Single: true,
-		Summary: "Fetch a page by path or URL", URIType: "page", Resolver: true,
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, getPage)
+	// search: full-text search across SRA, returns Run records.
+	kit.Handle(app, kit.OpMeta{Name: "search", Group: "read", List: true,
+		Summary: "Search NCBI SRA and return run records",
+		Args:    []kit.Arg{{Name: "query", Help: "search terms", Variadic: true}}}, searchRuns)
 
-	// List op: members of a page, the home of `sra links` and `ant ls`.
-	// It emits page stubs, so every listed member is itself an addressable
-	// sra://page/ URI a host can follow.
-	kit.Handle(app, kit.OpMeta{Name: "links", Group: "read", List: true,
-		Summary: "List the pages a page links to", URIType: "page",
-		Args: []kit.Arg{{Name: "ref", Help: "page path or URL"}}}, listLinks)
+	// run: fetch a single SRA run record by numeric UID.
+	kit.Handle(app, kit.OpMeta{Name: "run", Group: "read", Single: true,
+		Summary: "Fetch an SRA run record by numeric UID", URIType: "run", Resolver: true,
+		Args: []kit.Arg{{Name: "uid", Help: "SRA numeric UID or accession (SRR/ERR/DRR)"}}}, getRun)
+
+	// study: search SRA restricted to study-level records.
+	kit.Handle(app, kit.OpMeta{Name: "study", Group: "read", List: true,
+		Summary: "Search SRA studies by title or keyword",
+		Args:    []kit.Arg{{Name: "query", Help: "search terms", Variadic: true}}}, searchStudy)
+
+	// organism: search SRA by organism / taxonomy.
+	kit.Handle(app, kit.OpMeta{Name: "organism", Group: "read", List: true,
+		Summary: "Search SRA runs by organism name or taxon",
+		Args:    []kit.Arg{{Name: "taxon", Help: "organism name or taxon", Variadic: true}}}, searchOrganism)
 }
 
-// newClient builds the client from the host-resolved config, so a host and the
-// standalone binary pace and identify themselves the same way.
+// newClient builds the SRA client from the host-resolved config.
 func newClient(_ context.Context, cfg kit.Config) (any, error) {
-	c := NewClient()
+	scfg := DefaultConfig()
 	if cfg.UserAgent != "" {
-		c.UserAgent = cfg.UserAgent
+		scfg.UserAgent = cfg.UserAgent
 	}
 	if cfg.Rate > 0 {
-		c.Rate = cfg.Rate
+		scfg.Rate = cfg.Rate
 	}
 	if cfg.Retries > 0 {
-		c.Retries = cfg.Retries
+		scfg.Retries = cfg.Retries
 	}
 	if cfg.Timeout > 0 {
-		c.HTTP.Timeout = cfg.Timeout
+		scfg.Timeout = cfg.Timeout
 	}
-	return c, nil
+	return NewClientWithConfig(scfg), nil
 }
 
 // --- inputs ---
-//
-// Each handler takes a typed input struct. kit fills the fields from the tags:
-// kit:"arg" is a positional argument, kit:"flag,inherit" binds the framework's
-// shared flag of the same name, and kit:"inject" receives the client newClient
-// builds.
 
-type pageRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
+type searchInput struct {
+	Query  []string `kit:"arg,variadic" help:"search terms"`
+	Limit  int      `kit:"flag,inherit" help:"max results"`
+	Start  int      `kit:"flag" help:"result offset"`
+	Client *Client  `kit:"inject"`
+}
+
+type runRef struct {
+	UID    string  `kit:"arg" help:"SRA numeric UID or accession (SRR/ERR/DRR)"`
 	Client *Client `kit:"inject"`
 }
 
-type listRef struct {
-	Ref    string  `kit:"arg" help:"page path or URL"`
-	Limit  int     `kit:"flag,inherit" help:"max results"`
-	Client *Client `kit:"inject"`
+type studyInput struct {
+	Query  []string `kit:"arg,variadic" help:"study title or keyword"`
+	Limit  int      `kit:"flag,inherit" help:"max results"`
+	Start  int      `kit:"flag" help:"result offset"`
+	Client *Client  `kit:"inject"`
+}
+
+type organismInput struct {
+	Taxon  []string `kit:"arg,variadic" help:"organism name or taxon"`
+	Limit  int      `kit:"flag,inherit" help:"max results"`
+	Start  int      `kit:"flag" help:"result offset"`
+	Client *Client  `kit:"inject"`
 }
 
 // --- handlers ---
 
-func getPage(ctx context.Context, in pageRef, emit func(*Page) error) error {
-	p, err := in.Client.GetPage(ctx, pagePath(in.Ref))
+func searchRuns(ctx context.Context, in searchInput, emit func(*Run) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	runs, _, err := in.Client.SearchAndFetch(ctx, strings.Join(in.Query, " "), limit, in.Start)
 	if err != nil {
 		return mapErr(err)
 	}
-	return emit(p)
-}
-
-func listLinks(ctx context.Context, in listRef, emit func(*Page) error) error {
-	pages, err := in.Client.PageLinks(ctx, pagePath(in.Ref), in.Limit)
-	if err != nil {
-		return mapErr(err)
-	}
-	for _, p := range pages {
-		if err := emit(p); err != nil {
+	for _, r := range runs {
+		if err := emit(r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-// --- Resolver: the URI-native string functions, pure and network-free ---
-
-// Classify turns any accepted input — a bare path or a full sra.com URL —
-// into the canonical (type, id), so `ant resolve` and `ant url` touch no network.
-func (Domain) Classify(input string) (uriType, id string, err error) {
-	id = pagePath(input)
-	if id == "" {
-		return "", "", errs.Usage("unrecognized sra reference: %q", input)
+func getRun(ctx context.Context, in runRef, emit func(*Run) error) error {
+	uid := in.UID
+	// If the caller passes an accession like SRR21234567, search for it.
+	if !isDigits(uid) {
+		ids, _, err := in.Client.Search(ctx, uid+"[accession]", 1, 0)
+		if err != nil {
+			return mapErr(err)
+		}
+		if len(ids) == 0 {
+			return errs.NotFound("sra accession %s: not found", uid)
+		}
+		uid = ids[0]
 	}
-	return "page", id, nil
+	r, err := in.Client.GetRun(ctx, uid)
+	if err != nil {
+		return mapErr(err)
+	}
+	return emit(r)
+}
+
+func searchStudy(ctx context.Context, in studyInput, emit func(*Run) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	q := strings.Join(in.Query, " ")
+	// Append [study] qualifier to restrict to study-level hits.
+	if q != "" {
+		q = q + "[study]"
+	}
+	runs, _, err := in.Client.SearchAndFetch(ctx, q, limit, in.Start)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, r := range runs {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func searchOrganism(ctx context.Context, in organismInput, emit func(*Run) error) error {
+	limit := in.Limit
+	if limit <= 0 {
+		limit = 10
+	}
+	taxon := strings.Join(in.Taxon, " ")
+	q := taxon + "[organism]"
+	runs, _, err := in.Client.SearchAndFetch(ctx, q, limit, in.Start)
+	if err != nil {
+		return mapErr(err)
+	}
+	for _, r := range runs {
+		if err := emit(r); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// --- Resolver: pure string functions, no network ---
+
+// Classify turns any accepted input into the canonical (type, id).
+// All-digit strings are SRA UIDs. SRR/ERR/DRR accessions resolve via search.
+// Any other non-empty string is treated as a run reference.
+func (Domain) Classify(input string) (uriType, id string, err error) {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return "", "", errs.Usage("empty SRA reference")
+	}
+	return "run", input, nil
 }
 
 // Locate is the inverse: the live https URL for a (type, id).
 func (Domain) Locate(uriType, id string) (string, error) {
-	if uriType != "page" {
+	if uriType != "run" {
 		return "", errs.Usage("sra has no resource type %q", uriType)
 	}
-	return BaseURL + "/" + strings.Trim(id, "/"), nil
+	return "https://www.ncbi.nlm.nih.gov/sra/" + id, nil
 }
 
 // --- helpers ---
 
-// pagePath turns any accepted input into the canonical page id: the path of a
-// full URL on this host, or a bare path with its slashes trimmed.
-func pagePath(input string) string {
-	input = strings.TrimSpace(input)
-	if u, err := url.Parse(input); err == nil && (u.Scheme == "http" || u.Scheme == "https") {
-		return strings.Trim(u.Path, "/")
+// isDigits reports whether s is a non-empty string of ASCII digits.
+func isDigits(s string) bool {
+	if s == "" {
+		return false
 	}
-	return strings.Trim(input, "/")
+	for _, r := range s {
+		if !unicode.IsDigit(r) {
+			return false
+		}
+	}
+	return true
 }
 
 // mapErr converts a library error into the kit error kind that carries the right
-// exit code, so a host renders the same outcomes the standalone binary does. As
-// you add sentinel errors to the library, map them here, for example:
-//
-//	case errors.Is(err, ErrNotFound):
-//		return errs.NotFound("%s", err.Error())
-//	case errors.Is(err, ErrRateLimited):
-//		return errs.RateLimited("%s", err.Error())
+// exit code.
 func mapErr(err error) error {
 	return err
 }
